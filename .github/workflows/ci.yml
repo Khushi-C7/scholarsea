@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Shared Postgres connection settings for every job.
+env:
+  DATABASE_URL: postgresql://scholarsea:scholarsea@localhost:5432/scholarsea?schema=public
+  SHADOW_DATABASE_URL: postgresql://scholarsea:scholarsea@localhost:5432/scholarsea_shadow?schema=public
+  TEST_DATABASE_URL: postgresql://scholarsea:scholarsea@localhost:5432/scholarsea_test?schema=public
+  AUTH_SECRET: ci-secret-at-least-16-characters-long
+  CREDENTIAL_ENCRYPTION_KEY: ci-credential-key-change-me-in-production
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint, type-check, unit + integration tests, and a production build.
+  # ---------------------------------------------------------------------------
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scholarsea
+          POSTGRES_PASSWORD: scholarsea
+          POSTGRES_DB: scholarsea
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U scholarsea"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create shadow and test databases
+        run: |
+          PGPASSWORD=scholarsea psql -h localhost -U scholarsea -d scholarsea \
+            -c "CREATE DATABASE scholarsea_shadow;" || true
+          PGPASSWORD=scholarsea psql -h localhost -U scholarsea -d scholarsea \
+            -c "CREATE DATABASE scholarsea_test;" || true
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Apply migrations (app + test databases)
+        run: |
+          npm run db:deploy
+          DATABASE_URL="$TEST_DATABASE_URL" npm run db:deploy
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Unit + integration tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # End-to-end tests (Playwright) against the production build.
+  # ---------------------------------------------------------------------------
+  e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scholarsea
+          POSTGRES_PASSWORD: scholarsea
+          POSTGRES_DB: scholarsea
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U scholarsea"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create test database
+        run: |
+          PGPASSWORD=scholarsea psql -h localhost -U scholarsea -d scholarsea \
+            -c "CREATE DATABASE scholarsea_test;" || true
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Apply migrations (test database)
+        run: DATABASE_URL="$TEST_DATABASE_URL" npm run db:deploy
+
+      - name: Build
+        run: DATABASE_URL="$TEST_DATABASE_URL" npm run build
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E tests
+        run: npm run test:e2e
+        env:
+          CI: "true"
+          E2E_DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

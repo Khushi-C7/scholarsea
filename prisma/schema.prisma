@@ -1,0 +1,539 @@
+// ScholarSea — database schema
+// PostgreSQL + Prisma. See docs/DATA_MODEL.md for the rationale behind
+// ownership, indexes, and deletion behavior.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  runtime  = "nodejs"
+}
+
+datasource db {
+  // Prisma 7: connection URLs live in prisma.config.ts, not here. Runtime
+  // access uses the pg driver adapter in src/lib/db/prisma.ts.
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+/// How a paper entered the library. Determines which provenance fields apply.
+enum PaperSource {
+  PASTED_TEXT
+  PDF_UPLOAD
+  URL
+  ACADEMIC_SEARCH
+}
+
+/// Lifecycle of any long-running processing job (extraction, analysis, etc.).
+enum JobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+/// Category of a granular claim extracted from a paper. These are the
+/// building blocks the gap explorer compares across the corpus.
+enum ClaimType {
+  OBJECTIVE
+  METHOD
+  MODEL_ARCHITECTURE
+  DATASET
+  METRIC
+  RESULT
+  LIMITATION
+  FUTURE_WORK
+  CONTRIBUTION
+  ASSUMPTION
+  CONTEXT
+}
+
+/// Whether a piece of evidence supports, contradicts, or merely contextualizes
+/// a candidate gap. Contradictory evidence must be surfaced, not hidden.
+enum EvidenceStance {
+  SUPPORTING
+  CONTRADICTING
+  CONTEXTUAL
+}
+
+/// System-assigned verification state for a candidate gap. Confidence is not
+/// validity: a gap can be high-confidence and still UNVERIFIED.
+enum GapVerificationStatus {
+  UNVERIFIED
+  VERIFIED
+  REFUTED
+  NEEDS_REVIEW
+}
+
+/// User's manual disposition of a candidate gap in the evidence inspector.
+enum GapReviewStatus {
+  NONE
+  USEFUL
+  REJECTED
+  NEEDS_INVESTIGATION
+}
+
+/// Author of a chat message in contextual research chat.
+enum ChatRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+/// Kind of step in an autonomous agent run.
+enum AgentStepType {
+  PLAN
+  SEARCH
+  RETRIEVE
+  ANALYZE
+  COMPARE
+  SYNTHESIZE
+  TOOL_CALL
+}
+
+/// UI theme preference.
+enum ThemePreference {
+  LIGHT
+  DARK
+  SYSTEM
+}
+
+// ---------------------------------------------------------------------------
+// Identity & preferences
+// ---------------------------------------------------------------------------
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  image     String?
+  // bcrypt hash of the password for credentials auth. Nullable so future
+  // OAuth-only accounts can exist without one. Never exposed to the client.
+  passwordHash String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Everything a user owns cascades when the user is deleted.
+  preference    UserPreference?
+  projects      ResearchProject[]
+  papers        Paper[]
+  notes         ResearchNote[]
+  conversations Conversation[]
+  agentSessions AgentSession[]
+  gapAnalyses   ResearchGapAnalysis[]
+
+  @@index([email])
+}
+
+model UserPreference {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  aiProvider     String?
+  aiModel        String?
+  outputLanguage String          @default("en")
+  theme          ThemePreference @default(SYSTEM)
+
+  // Versioned prompt overrides keyed by prompt id.
+  promptOverrides Json?
+
+  // Ciphertext only. Provider API keys are encrypted at the application layer
+  // before they are ever written here; plaintext keys never touch the DB.
+  encryptedCredentials Json?
+
+  // Free-form additional settings for forward compatibility.
+  settings Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Projects, papers, and the project<->paper join
+// ---------------------------------------------------------------------------
+
+model ResearchProject {
+  id          String  @id @default(cuid())
+  ownerId     String
+  owner       User    @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  projectPapers ProjectPaper[]
+  gapAnalyses   ResearchGapAnalysis[]
+  // Notes and conversations may be scoped to a project but should survive the
+  // project's deletion if they also reference a paper, so they SetNull below.
+  notes         ResearchNote[]
+  conversations Conversation[]
+  agentSessions AgentSession[]
+
+  // A user cannot have two projects with the same name.
+  @@unique([ownerId, name])
+  @@index([ownerId])
+}
+
+/// Canonical paper record. This is the single source of truth for paper
+/// metadata; no other table duplicates it — they reference it by id.
+model Paper {
+  id      String @id @default(cuid())
+  ownerId String
+  owner   User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  title    String
+  abstract String?
+  authors  String[] @default([])
+  year     Int?
+  venue    String?
+  doi      String?
+  arxivId  String?
+  url      String?
+
+  source    PaperSource
+  sourceUrl String?
+
+  // Extracted full text lives here; the original uploaded file (if any) lives
+  // in object storage, referenced by storageKey.
+  fullText   String?
+  storageKey String?
+  pageCount  Int?
+
+  // SHA-256 of the normalized content, used for duplicate detection.
+  contentHash String?
+
+  // Any additional structured metadata the extractor captured.
+  metadata Json?
+
+  extractionStatus JobStatus @default(PENDING)
+  extractionError  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  projectPapers ProjectPaper[]
+  analyses      PaperAnalysis[]
+  claims        ExtractedClaim[]
+  gapEvidence   GapEvidence[]
+  notes         ResearchNote[]
+
+  // Duplicate detection scoped per owner: identical content, DOI, or arXiv id
+  // cannot be ingested twice by the same user.
+  @@unique([ownerId, contentHash])
+  @@unique([ownerId, doi])
+  @@unique([ownerId, arxivId])
+  @@index([ownerId])
+  @@index([year])
+  @@index([doi])
+  @@index([arxivId])
+}
+
+/// Join table placing a Paper inside a ResearchProject, with per-project tags.
+model ProjectPaper {
+  id        String          @id @default(cuid())
+  projectId String
+  project   ResearchProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  paperId   String
+  paper     Paper           @relation(fields: [paperId], references: [id], onDelete: Cascade)
+
+  tags    String[] @default([])
+  addedAt DateTime @default(now())
+
+  @@unique([projectId, paperId])
+  @@index([projectId])
+  @@index([paperId])
+}
+
+// ---------------------------------------------------------------------------
+// Paper analysis & extracted claims
+// ---------------------------------------------------------------------------
+
+/// A structured research-insight report produced by the multi-agent pipeline
+/// for one paper. Re-runs create new versions rather than overwriting.
+model PaperAnalysis {
+  id      String @id @default(cuid())
+  paperId String
+  paper   Paper  @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  version Int    @default(1)
+
+  summary         String?
+  researchProblem String?
+  motivation      String?
+  methodology     String?
+
+  // Structured sections stored as JSON arrays/objects.
+  contributions     Json?
+  datasets          Json?
+  results           Json?
+  metrics           Json?
+  limitations       Json?
+  terminology       Json?
+  relatedWork       Json?
+  references        Json?
+  followUpQuestions Json?
+
+  // Provenance of the generation.
+  modelProvider String?
+  modelName     String?
+  tokensUsed    Int?
+
+  // Full structured multi-agent run artifact (reader key points, synthesizer
+  // output, per-stage status, demo flag). The dedicated columns above are the
+  // normalized extraction; this is the complete raw report.
+  report Json?
+
+  status JobStatus @default(PENDING)
+  error  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  claims ExtractedClaim[]
+
+  @@unique([paperId, version])
+  @@index([paperId])
+  @@index([status])
+}
+
+/// A single, source-linked claim extracted from a paper. Retains the verbatim
+/// supporting passage and its location so every downstream citation is traceable.
+model ExtractedClaim {
+  id         String         @id @default(cuid())
+  paperId    String
+  paper      Paper          @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  analysisId String?
+  analysis   PaperAnalysis? @relation(fields: [analysisId], references: [id], onDelete: SetNull)
+
+  type              ClaimType
+  text              String
+  supportingPassage String
+  // { page?, section?, charStart?, charEnd? }
+  location          Json?
+  confidence        Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gapEvidence GapEvidence[]
+
+  @@index([paperId])
+  @@index([analysisId])
+  @@index([type])
+}
+
+// ---------------------------------------------------------------------------
+// Research gap explorer (flagship)
+// ---------------------------------------------------------------------------
+
+/// One cross-paper gap-analysis run over a project's corpus.
+model ResearchGapAnalysis {
+  id        String          @id @default(cuid())
+  projectId String
+  project   ResearchProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  ownerId   String
+  owner     User            @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  status     JobStatus @default(PENDING)
+  paperCount Int       @default(0)
+  // Snapshot of exactly which papers were in the corpus for this run.
+  examinedPaperIds String[] @default([])
+
+  executiveSummary String?
+  coverageNotes    String?
+  patterns         Json?
+  limitations      String?
+  error            String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gaps ResearchGap[]
+
+  @@index([projectId])
+  @@index([ownerId])
+  @@index([status])
+}
+
+/// A candidate research gap with its rationale and user disposition.
+model ResearchGap {
+  id         String              @id @default(cuid())
+  analysisId String
+  analysis   ResearchGapAnalysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+
+  title               String
+  explanation         String
+  significance        String?
+  confidenceRationale String?
+  evidenceCoverage    String?
+  paperCountExamined  Int?
+
+  suggestedExperiments Json?
+  researchQuestions    Json?
+
+  verificationStatus GapVerificationStatus @default(UNVERIFIED)
+  reviewStatus       GapReviewStatus       @default(NONE)
+  reviewerNotes      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  evidence GapEvidence[]
+  notes    ResearchNote[]
+
+  @@index([analysisId])
+  @@index([verificationStatus])
+  @@index([reviewStatus])
+}
+
+/// Evidence linking a candidate gap to a real passage in a real paper.
+/// The FK to Paper guarantees no gap can cite a document that does not exist.
+model GapEvidence {
+  id    String      @id @default(cuid())
+  gapId String
+  gap   ResearchGap @relation(fields: [gapId], references: [id], onDelete: Cascade)
+
+  paperId String
+  paper   Paper   @relation(fields: [paperId], references: [id], onDelete: Cascade)
+
+  // Optional link to the structured claim this evidence came from.
+  claimId String?
+  claim   ExtractedClaim? @relation(fields: [claimId], references: [id], onDelete: SetNull)
+
+  stance   EvidenceStance
+  passage  String
+  location Json?
+  note     String?
+  // False until the passage has been checked against the source document.
+  verified Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([gapId])
+  @@index([paperId])
+  @@index([claimId])
+}
+
+// ---------------------------------------------------------------------------
+// Notes, chat, and the autonomous agent
+// ---------------------------------------------------------------------------
+
+/// A user note or bookmark. May attach to a project, a paper, and/or a gap.
+/// Optional parents SetNull so a note outlives a deleted container when it is
+/// still anchored to something else.
+model ResearchNote {
+  id      String @id @default(cuid())
+  ownerId String
+  owner   User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  projectId String?
+  project   ResearchProject? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  paperId   String?
+  paper     Paper?           @relation(fields: [paperId], references: [id], onDelete: SetNull)
+  gapId     String?
+  gap       ResearchGap?     @relation(fields: [gapId], references: [id], onDelete: SetNull)
+
+  body       String
+  bookmarked Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
+  @@index([projectId])
+  @@index([paperId])
+  @@index([gapId])
+}
+
+/// A contextual-chat conversation scoped to a project and/or a set of papers.
+model Conversation {
+  id      String @id @default(cuid())
+  ownerId String
+  owner   User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  projectId String?
+  project   ResearchProject? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  title String?
+  // Which papers are in retrieval scope for this conversation.
+  paperIds String[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages ChatMessage[]
+
+  @@index([ownerId])
+  @@index([projectId])
+}
+
+model ChatMessage {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  role    ChatRole
+  content String
+  // Source citations: [{ paperId, passage, location }]
+  citations  Json?
+  tokensUsed Int?
+
+  createdAt DateTime @default(now())
+
+  @@index([conversationId])
+  @@index([conversationId, createdAt])
+}
+
+/// A goal-based autonomous research run.
+model AgentSession {
+  id      String @id @default(cuid())
+  ownerId String
+  owner   User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  projectId String?
+  project   ResearchProject? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  goal        String
+  status      JobStatus @default(PENDING)
+  finalAnswer String?
+  citations   Json?
+  // Enforced bounds for the run: { maxToolCalls, maxRuntimeMs, tokenBudget }.
+  limits      Json?
+  tokensUsed  Int?
+  error       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  steps AgentStep[]
+
+  @@index([ownerId])
+  @@index([projectId])
+  @@index([status])
+}
+
+model AgentStep {
+  id        String       @id @default(cuid())
+  sessionId String
+  session   AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  index    Int
+  type     AgentStepType
+  toolName String?
+  status   JobStatus     @default(PENDING)
+  input    Json?
+  output   Json?
+  error    String?
+
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@unique([sessionId, index])
+  @@index([sessionId])
+}
